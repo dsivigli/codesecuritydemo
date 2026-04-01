@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Search - Vulnerable Flask App</title>
+</head>
+<body>
+    <h1>Search Results</h1>
+    
+    <!-- VULNERABILITY: XSS -->
+    <h2>Results for: <span id="search-query"></span></h2>
+    <script>
+        document.getElementById("search-query").innerHTML = `{{ query }}`;
+    </script>
+    
+    <ul>
+        {% for result in results %}
+        <li>{{ result }}</li>
+        {% endfor %}
+    </ul>
+    
+    <div>
+        <a href="/dashboard">Back to Dashboard</a>
+    </div>
+</body>
+</html>

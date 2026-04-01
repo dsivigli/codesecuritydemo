@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for vulnerable Flask application with CloudWatch agent deployment'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: 'REQUIRED: Name of the S3 bucket for application files. Must be globally unique (e.g., my-vulnerable-app-bucket-2024)'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be 3-63 characters, lowercase letters/numbers/hyphens only, cannot start/end with hyphen'
+
+Resources:
+  # ========================================
+  # IAM ROLES AND POLICIES
+  # ========================================
+  
+  # Consolidated IAM Role for EC2 instance
+  VulnerableInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  VulnerableInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref VulnerableInstanceRole
+
+  # Consolidated IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStackResources
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource: '*'
+
+  # ========================================
+  # CLOUDWATCH AGENT DEPLOYMENT
+  # ========================================
+
+  # CloudWatch agent deployment Lambda function
+  CloudWatchAgentLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cloudwatch-agent-deployment'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          SSM_DOCUMENT_NAME: 'AmazonCloudWatch-ManageAgent'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          import cfnresponse
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"CloudWatch agent deployment: {json.dumps(event)}")
+                  
+                  # Handle CloudFormation custom resource
+                  if 'RequestType' in event:
+                      if event['RequestType'] == 'Delete':
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          return
+                  
+                  ec2_client = boto3.client('ec2')
+                  ssm_client = boto3.client('ssm')
+                  cloudformation_client = boto3.client('cloudformation')
+                  
+                  stack_name = event.get('stack_name', os.environ.get('STACK_NAME'))
+                  instance_ids = event.get('instance_ids', [])
+                  
+                  # Auto-discover instances from stack
+                  if not instance_ids and stack_name:
+                      try:
+                          stack_response = cloudformation_client.describe_stacks(StackName=stack_name)
+                          outputs = stack_response['Stacks'][0].get('Outputs', [])
+                          
+                          for output in outputs:
+                              if output['OutputKey'] == 'EC2InstanceId':
+                                  instance_ids.append(output['OutputValue'])
+                                  break
+                          
+                          if not instance_ids:
+                              response = ec2_client.describe_instances(
+                                  Filters=[
+                                      {'Name': 'tag:aws:cloudformation:stack-name', 'Values': [stack_name]},
+                                      {'Name': 'instance-state-name', 'Values': ['running']}
+                                  ]
+                              )
+                              for reservation in response['Reservations']:
+                                  for instance in reservation['Instances']:
+                                      instance_ids.append(instance['InstanceId'])
+                      except Exception as e:
+                          logger.error(f"Error discovering instances: {str(e)}")
+                          if 'RequestType' in event:
+                              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                          return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+                  
+                  if not instance_ids:
+                      logger.error("No instances found")
+                      if 'RequestType' in event:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': 'No instances found'})
+                      return {'statusCode': 404, 'body': json.dumps({'error': 'No instances found'})}
+                  
+                  # Wait for instance to be SSM ready
+                  logger.info(f"Waiting for instances to be SSM ready: {instance_ids}")
+                  max_wait_time = 300  # 5 minutes
+                  wait_interval = 30   # 30 seconds
+                  elapsed_time = 0
+                  
+                  while elapsed_time < max_wait_time:
+                      try:
+                          response = ssm_client.describe_instance_information(
+                              Filters=[{'Key': 'InstanceIds', 'Values': instance_ids}]
+                          )
+                          
+                          ready_instances = [info['InstanceId'] for info in response['InstanceInformationList'] 
+                                           if info['PingStatus'] == 'Online']
+                          
+                          if len(ready_instances) == len(instance_ids):
+                              logger.info("All instances are SSM ready")
+                              break
+                          
+                          logger.info(f"Waiting for SSM readiness. Ready: {ready_instances}, Target: {instance_ids}")
+                          time.sleep(wait_interval)
+                          elapsed_time += wait_interval
+                          
+                      except Exception as e:
+                          logger.warning(f"Error checking SSM status: {str(e)}")
+                          time.sleep(wait_interval)
+                          elapsed_time += wait_interval
+                  
+                  # Execute SSM command using AWS managed document
+                  try:
+                      logger.info(f"Installing CloudWatch agent using {os.environ.get('SSM_DOCUMENT_NAME')}")
+                      command_response = ssm_client.send_command(
+                          InstanceIds=instance_ids,
+                          DocumentName=os.environ.get('SSM_DOCUMENT_NAME'),
+                          Parameters={
+                              'action': ['configure'],
+                              'mode': ['ec2'],
+                              'optionalConfigurationSource': ['default'],
+                              'optionalConfigurationLocation': [''],
+                              'optionalRestart': ['yes']
+                          },
+                          TimeoutSeconds=1800
+                      )
+                      
+                      command_id = command_response['Command']['CommandId']
+                      logger.info(f"SSM command executed: {command_id}")
+                      
+                      result = {
+                          'status': 'success',
+                          'command_id': command_id,
+                          'instance_ids': instance_ids,
+                          'document_name': os.environ.get('SSM_DOCUMENT_NAME')
+                      }
+                      
+                      if 'RequestType' in event:
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+                      
+                      return {'statusCode': 200, 'body': json.dumps(result)}
+                      
+                  except Exception as e:
+                      logger.error(f"Error executing SSM command: {str(e)}")
+                      if 'RequestType' in event:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                      return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+              
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  if 'RequestType' in event:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+  # ========================================
+  # S3-TRIGGERED DEPLOYMENT
+  # ========================================
+  
+  # S3 trigger Lambda function
+  S3TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3-trigger-deployment'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"S3 event: {json.dumps(event)}")
+                  
+                  s3_bucket = event['Records'][0]['s3']['bucket']['name']
+                  s3_key = event['Records'][0]['s3']['object']['key']
+                  
+                  # Only process files in application/ folder
+                  if not s3_key.startswith('application/'):
+                      return {'statusCode': 200, 'body': 'File ignored'}
+                  
+                  ec2_client = boto3.client('ec2')
+                  ssm_client = boto3.client('ssm')
+                  
+                  # Find instance
+                  response = ec2_client.describe_instances(
+                      Filters=[
+                          {'Name': 'tag:aws:cloudformation:stack-name', 'Values': [os.environ['STACK_NAME']]},
+                          {'Name': 'instance-state-name', 'Values': ['running']}
+                      ]
+                  )
+                  
+                  if not response['Reservations']:
+                      return {'statusCode': 404, 'body': 'No instances found'}
+                  
+                  instance_id = response['Reservations'][0]['Instances'][0]['InstanceId']
+                  
+                  # Update application from application/ folder
+                  update_commands = [
+                      'cd /home/ec2-user/vulnerable-app',
+                      'sudo systemctl stop vulnerable-flask',
+                      f'aws s3 sync s3://{s3_bucket}/application/ . --delete',
+                      'sudo pip3 install -r requirements.txt',
+                      'sudo chown -R ec2-user:ec2-user /home/ec2-user/vulnerable-app',
+                      'sudo systemctl start vulnerable-flask'
+                  ]
+                  
+                  command_response = ssm_client.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName='AWS-RunShellScript',
+                      Parameters={'commands': update_commands}
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Update triggered',
+                          'instance_id': instance_id,
+                          'command_id': command_response['Command']['CommandId']
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+
+  # S3 event configuration Lambda
+  S3EventConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3-event-config'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  s3_client = boto3.client('s3')
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  lambda_arn = event['ResourceProperties']['LambdaArn']
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      notification_config = {
+                          'LambdaFunctionConfigurations': [{
+                              'Id': 'AppFileUpdateTrigger',
+                              'LambdaFunctionArn': lambda_arn,
+                              'Events': ['s3:ObjectCreated:Put', 's3:ObjectCreated:Post']
+                          }]
+                      }
+                      s3_client.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration=notification_config
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      s3_client.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration={}
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Lambda permissions
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3TriggerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  # ========================================
+  # CUSTOM RESOURCES
+  # ========================================
+  
+  # S3 event configuration
+  S3EventConfiguration:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: S3InvokeLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt S3EventConfigFunction.Arn
+      BucketName: !Ref S3BucketName
+      LambdaArn: !GetAtt S3TriggerLambdaFunction.Arn
+
+  # CloudWatch agent deployment
+  CloudWatchAgentDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: VulnerableInstance
+    Properties:
+      ServiceToken: !GetAtt CloudWatchAgentLambdaFunction.Arn
+      stack_name: !Ref AWS::StackName
+      config_name: 'default-config'
+      region: !Ref AWS::Region
+
+  # ========================================
+  # NETWORKING
+  # ========================================
+  
+  VulnerableVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: VulnerableVPC
+
+  VulnerableInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: VulnerableIGW
+
+  VulnerableVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VulnerableVPC
+      InternetGatewayId: !Ref VulnerableInternetGateway
+
+  VulnerablePublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VulnerableVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs ""
+      Tags:
+        - Key: Name
+          Value: VulnerablePublicSubnet
+          
+  VulnerablePublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VulnerableVPC
+      Tags:
+        - Key: Name
+          Value: VulnerablePublicRT
+
+  VulnerablePublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VulnerableVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref VulnerablePublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VulnerableInternetGateway
+
+  VulnerablePublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref VulnerablePublicSubnet
+      RouteTableId: !Ref VulnerablePublicRouteTable
+
+  # ========================================
+  # EC2 INSTANCE
+  # ========================================
+  
+  # VULNERABILITY: Security group with all ports open
+  VulnerableSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VulnerableVPC
+      GroupDescription: Security group for vulnerable Flask app
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5001
+          ToPort: 5001
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # VULNERABILITY: EC2 instance with public IP
+  VulnerableInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-00ca32bbc84273381  # Amazon Linux 2 in us-east-1
+      SubnetId: !Ref VulnerablePublicSubnet
+      SecurityGroupIds:
+        - !Ref VulnerableSecurityGroup
+      IamInstanceProfile: !Ref VulnerableInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+
+          # Install Python 3 and pip
+          yum install -y python3 python3-pip
+
+          # VULNERABILITY: Hardcoded credentials
+          echo "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" >> /etc/environment
+          echo "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" >> /etc/environment
+          echo "DB_PASSWORD=insecure_password" >> /etc/environment
+          
+          # Setup application
+          mkdir -p /home/ec2-user/vulnerable-app
+          cd /home/ec2-user/vulnerable-app
+          
+          # Download application files from application/ folder
+          aws s3 sync s3://${S3BucketName}/application/ . --delete || { echo "ERROR: Failed to download application files"; exit 1; }
+          
+          # Install dependencies
+          pip3 install -r requirements.txt
+          chown -R ec2-user:ec2-user /home/ec2-user/vulnerable-app
+          
+          # Create systemd service
+          cat > /etc/systemd/system/vulnerable-flask.service << 'EOF'
+          [Unit]
+          Description=Vulnerable Flask Application
+          After=network.target
+
+          [Service]
+          WorkingDirectory=/home/ec2-user/vulnerable-app
+          ExecStart=/usr/bin/python3 app.py
+          Restart=always
+          User=ec2-user
+          Environment=AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+          Environment=AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+          Environment=DB_PASSWORD=insecure_password
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          # Start service
+          systemctl daemon-reload
+          systemctl enable vulnerable-flask
+          systemctl start vulnerable-flask
+          
+          echo "=== DEPLOYMENT COMPLETE ==="
+      Tags:
+        - Key: Name
+          Value: VulnerableAppServer
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt VulnerableInstance.PublicIp
+  
+  ApplicationURL:
+    Description: URL to access the vulnerable application
+    Value: !Join ['', ['http://', !GetAtt VulnerableInstance.PublicIp, ':5001']]
+  
+  S3BucketName:
+    Description: S3 bucket name used for application files
+    Value: !Ref S3BucketName
+  
+  LambdaFunctionName:
+    Description: Name of the Lambda function for S3-triggered deployments
+    Value: !Ref S3TriggerLambdaFunction
+  
+  CloudWatchAgentLambdaFunctionName:
+    Description: Name of the CloudWatch agent deployment Lambda function
+    Value: !Ref CloudWatchAgentLambdaFunction
+  
+  EC2InstanceId:
+    Description: EC2 Instance ID for monitoring
+    Value: !Ref VulnerableInstance
