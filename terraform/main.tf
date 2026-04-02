@@ -98,4 +98,35 @@ resource "aws_iam_access_key" "app_user_key" {
   user = aws_iam_user.app_user.name
 }
 
+# VULNERABILITY: Public S3 bucket with no encryption
+resource "aws_s3_bucket" "app_bucket" {
+  bucket = "vulnerable-demo-bucket"
+  # VULNERABILITY: ACL should not be public-read
+  acl    = "public-read"
+}
+
+# VULNERABILITY: Public S3 bucket with no encryption
+resource "aws_s3_bucket" "app_bucket1" {
+  bucket = "vulnerable-demo-bucket"
+  # VULNERABILITY: ACL should not be public-read
+  acl    = "public-read"
+}
+
+# VULNERABILITY: S3 bucket policy allowing public access
+resource "aws_s3_bucket_policy" "app_bucket_policy" {
+  bucket = aws_s3_bucket.app_bucket.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.app_bucket.arn}/*"
+      }
+    ]
+  })
+}
+
+
 
