@@ -141,6 +141,41 @@ def execute_command():
         # VULNERABILITY: Exposing system error details
         return f"Error executing command: {str(e)}"
 
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    if 'file' not in request.files:
+        return "No file part"
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return "No selected file"
+    
+    # VULNERABILITY: Insufficient file validation
+    filename = secure_filename(file.filename)
+    file_path = os.path.join('/tmp', filename)
+    file.save(file_path)
+    
+    # VULNERABILITY: Insecure file permissions
+    os.chmod(file_path, 0o777)
+    
+    # VULNERABILITY: Using hardcoded AWS credentials
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION
+    )
+    
+    # VULNERABILITY: No content type validation
+    s3_client.upload_file(file_path, S3_BUCKET, filename)
+    
+    return f"File uploaded to s3://{S3_BUCKET}/{filename}"
+
+
 
 @app.route('/api/user/<int:user_id>')
 def api_get_user(user_id):
